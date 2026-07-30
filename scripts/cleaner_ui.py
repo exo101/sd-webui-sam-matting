@@ -65,7 +65,7 @@ except ImportError:
             import modules
             parameters_copypaste = modules.generation_parameters_copypaste
         except:
-            print("Warning: Could not import generation_parameters_copypaste")
+            # WebUI Forge 中没有此模块，静默处理
             parameters_copypaste = None
 
 # 直接导入依赖库

@@ -14,6 +14,11 @@ scripts_dir = Path(__file__).parent
 if str(scripts_dir) not in sys.path:
     sys.path.insert(0, str(scripts_dir))
 
+# 添加 nobg 目录到 Python 路径（用于 nobg 抠图模型）
+nobg_dir = plugin_dir / "nobg"
+if str(nobg_dir) not in sys.path:
+    sys.path.insert(0, str(nobg_dir))
+
 # 自动安装依赖
 def auto_install_dependencies():
     """自动安装 SAM Matting 所需的依赖包"""
@@ -146,23 +151,7 @@ def segmentation_tab():
                 else:
                     gr.Markdown("图像清理模块不可用。请确保已安装 litelama 库。")
     
-    return [(ui, "图像分割与智能抠图", "Segmentation_Tab")]
+    return [(ui, "智能抠图与图像清理", "Segmentation_Tab")]
 
-
-def on_app_started(*args, **kwargs):
-    """在 WebUI 启动时显示插件信息"""
-    print("=" * 60)
-    print("SAM 智能分割与抠图插件 - SAM Matting")
-    print()
-    print("集成功能：")
-    print("- Segment Anything 图像分割")
-    print("- Rembg 智能抠图")
-    print("- LiteLama 图像清理")
-    print()
-    print("使用须知：请确保已安装所有必要的依赖库。")
-    print("=" * 60)
-
-
-# 注册标签页和启动事件
+# 注册标签页
 script_callbacks.on_ui_tabs(segmentation_tab)
-script_callbacks.on_app_started(on_app_started)

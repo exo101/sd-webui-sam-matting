@@ -1,4 +1,4 @@
-﻿import os
+import os
 import numpy as np
 import torch
 import gradio as gr
@@ -18,6 +18,91 @@ except ImportError:
     SAM_AVAILABLE = False
     
 
+def _download_sam_checkpoint(save_path, model_type):
+    """从多个镜像自动下载SAM模型检查点
+    
+    Args:
+        save_path: 模型保存路径
+        model_type: 模型类型 (vit_h/vit_l/vit_b)
+    
+    Returns:
+        bool: 下载是否成功
+    """
+    import urllib.request
+    
+    # 模型文件名映射
+    model_filenames = {
+        "vit_h": "sam_vit_h_4b8939.pth",
+        "vit_l": "sam_vit_l_0b3195.pth",
+        "vit_b": "sam_vit_b_01ec64.pth"
+    }
+    
+    filename = model_filenames.get(model_type)
+    if not filename:
+        print(f"[SAM Matting] 未知的模型类型: {model_type}")
+        return False
+    
+    # 如果文件已存在（如之前下载中断留下的），先删除
+    if os.path.lexists(save_path):
+        print(f"[SAM Matting] 删除已存在的文件: {save_path}")
+        os.remove(save_path)
+    
+    # 多镜像下载列表
+    env_mirror = os.environ.get("SAM_DOWNLOAD_MIRROR", "")
+    mirror_urls = []
+    
+    if env_mirror:
+        mirror_urls.append(env_mirror + filename)
+    
+    # 默认镜像列表（按优先级排序）
+    mirror_urls += [
+        f"https://dl.fbaipublicfiles.com/segment_anything/{filename}",
+        f"https://hf-mirror.com/facebook/sam-{model_type.replace('_', '-')}/resolve/main/{filename}",
+    ]
+    
+    print(f"[SAM Matting] 模型文件不存在，开始自动下载...")
+    last_error = None
+    for url in mirror_urls:
+        try:
+            print(f"[SAM Matting] 尝试从镜像下载: {url}")
+            print(f"[SAM Matting] 保存到: {save_path}")
+            
+            def report_progress(block_count, block_size, total_size):
+                downloaded = block_count * block_size / (1024 * 1024)
+                if total_size > 0:
+                    total_mb = total_size / (1024 * 1024)
+                    percent = min(100, downloaded / total_mb * 100)
+                    print(f"\r[SAM Matting] 下载中: {percent:.1f}% ({downloaded:.1f}/{total_mb:.1f} MB)", end="")
+                else:
+                    print(f"\r[SAM Matting] 下载中: {downloaded:.1f} MB...", end="")
+            
+            urllib.request.urlretrieve(url, save_path, reporthook=report_progress)
+            print()
+            
+            # 验证文件大小
+            file_size = os.path.getsize(save_path)
+            if file_size > 1024 * 1024:  # 至少 1MB 才认为有效
+                print(f"[SAM Matting] 下载成功: {save_path} ({file_size / (1024*1024):.1f} MB)")
+                return True
+            else:
+                print(f"[SAM Matting] 文件太小 ({file_size} bytes)，可能无效")
+                os.remove(save_path)
+                continue
+                
+        except Exception as e:
+            print(f"\n[SAM Matting] 下载失败: {e}")
+            last_error = e
+            if os.path.exists(save_path):
+                os.remove(save_path)
+            continue
+    
+    print(f"[SAM Matting] 所有镜像下载失败。最后一个错误: {last_error}")
+    print(f"[SAM Matting] 您可以手动下载模型:")
+    print(f"[SAM Matting]   {mirror_urls[0] if not env_mirror else env_mirror + filename}")
+    print(f"[SAM Matting] 并放置到: {os.path.dirname(save_path)}")
+    return False
+
+
 def initialize_sam_model(model_type=None):
     """初始化SAM模型"""
     if not SAM_AVAILABLE:
@@ -28,6 +113,7 @@ def initialize_sam_model(model_type=None):
     # 通过环境变量或默认方式获取WebUI根目录
     webui_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     model_dir = os.path.join(webui_root, "models", "sams")
+    os.makedirs(model_dir, exist_ok=True)
     model_paths = {
         "vit_h": os.path.join(model_dir, "sam_vit_h_4b8939.pth"),  # 2.38G
         "vit_l": os.path.join(model_dir, "sam_vit_l_0b3195.pth")   # 1.25G
@@ -41,20 +127,23 @@ def initialize_sam_model(model_type=None):
                 print(f"找到模型文件: {m_type} ({m_path})")
                 break
         else:
-            # 如果没有找到任何模型文件
-            print("未找到任何模型文件:")
-            for m_type, m_path in model_paths.items():
-                print(f"  {m_type}: {m_path}")
-            print("请确保至少一个模型文件已下载并放置在正确路径下")
-            return None
+            # 如果没有找到任何模型文件，尝试自动下载 vit_h
+            print("未找到任何模型文件，尝试自动下载...")
+            model_type = "vit_h"
+            model_path = model_paths[model_type]
+            if not _download_sam_checkpoint(model_path, model_type):
+                print("自动下载失败，请确保模型文件已下载并放置在正确路径下")
+                return None
     
     model_path = model_paths.get(model_type, model_paths["vit_h"])
     
-    # 检查指定的模型文件是否存在
+    # 检查指定的模型文件是否存在，不存在则尝试自动下载
     if not os.path.exists(model_path):
         print(f"模型文件不存在: {model_path}")
-        print("请确保模型文件已下载并放置在正确路径下")
-        return None
+        print("尝试自动下载...")
+        if not _download_sam_checkpoint(model_path, model_type):
+            print("自动下载失败，请确保模型文件已下载并放置在正确路径下")
+            return None
     
     try:
         # 加载真实的 SAM 模型

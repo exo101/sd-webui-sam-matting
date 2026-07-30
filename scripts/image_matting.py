@@ -17,6 +17,19 @@ ADVANCED_MATTING_MODELS = {
     "InSPyReNet-Base (金字塔细化)": "inspyrenet-base",
 }
 
+# nobg 支持的 BiRefNet 模型列表（可通过 AutoModel 加载）
+NOBG_MODELS = {
+    "nobg-BiRefNet (通用)": "ZhengPeng7/BiRefNet",
+    "nobg-BiRefNet_HR (高分辨率)": "ZhengPeng7/BiRefNet_HR",
+    "nobg-BiRefNet-lite (轻量版)": "ZhengPeng7/BiRefNet-lite",
+    "nobg-BiRefNet-general (通用v2)": "ZhengPeng7/BiRefNet-general",
+    "nobg-BiRefNet-portrait (人像)": "ZhengPeng7/BiRefNet-portrait",
+    "nobg-BiRefNet-DIS (突出目标)": "ZhengPeng7/BiRefNet-DIS",
+    "nobg-BiRefNet-HRSOD (高分辨率突出)": "ZhengPeng7/BiRefNet-HRSOD",
+    "nobg-BiRefNet-cod (伪装目标)": "ZhengPeng7/BiRefNet-cod",
+    "nobg-BiRefNet-massive (大规模)": "ZhengPeng7/BiRefNet-massive",
+}
+
 def create_image_matting_module():
     """创建智能抠图模块并返回组件结构"""
     result = {}
@@ -55,10 +68,10 @@ def create_image_matting_module():
             
             # 添加模型选择器
             rm_model_select = gr.Dropdown(
-                choices=list(REMBG_MODELS.keys()) + ["--- 高级模型 (需安装依赖) ---"] + list(ADVANCED_MATTING_MODELS.keys()),
+                choices=list(REMBG_MODELS.keys()) + ["--- 高级模型 (需安装依赖) ---"] + list(ADVANCED_MATTING_MODELS.keys()) + ["--- nobg 模型 ---"] + list(NOBG_MODELS.keys()),
                 value="u2net (通用推荐)",
                 label="选择抠图模型",
-                info="rembg模型自动下载；高级模型需手动安装依赖"
+                info="rembg模型自动下载；高级模型需手动安装依赖；nobg模型支持多种BiRefNet变体"
             )
             
             # 添加模型说明（折叠起来节省空间）
@@ -71,10 +84,22 @@ def create_image_matting_module():
                 gr.Markdown("- **BiRefNet-Matting**: 精细抠图，毛发级精度")
                 gr.Markdown("- **InSPyReNet**: 金字塔细化，高分辨率图像专业级质量")
                 gr.Markdown("")
+                gr.Markdown("**nobg 模型说明**:")
+                gr.Markdown("- **nobg-BiRefNet (通用)**: 默认通用抠图模型")
+                gr.Markdown("- **nobg-BiRefNet_HR (高分辨率)**: 高分辨率精细抠图")
+                gr.Markdown("- **nobg-BiRefNet-lite (轻量版)**: 轻量快速抠图")
+                gr.Markdown("- **nobg-BiRefNet-general (通用v2)**: 改进版通用模型")
+                gr.Markdown("- **nobg-BiRefNet-portrait (人像)**: 人像抠图专用")
+                gr.Markdown("- **nobg-BiRefNet-DIS (突出目标)**: 突出目标分割")
+                gr.Markdown("- **nobg-BiRefNet-HRSOD (高分辨率突出)**: 高分辨率目标分割")
+                gr.Markdown("- **nobg-BiRefNet-cod (伪装目标)**: 伪装目标检测")
+                gr.Markdown("- **nobg-BiRefNet-massive (大规模)**: 大规模模型")
+                gr.Markdown("")
                 gr.Markdown("**模型下载说明**:")
                 gr.Markdown("- rembg模型: `models/rembg/`")
                 gr.Markdown("- BiRefNet模型: `models/BiRefNet/`")
                 gr.Markdown("- InSPyReNet模型: `models/InSPyReNet/` (需安装: `pip install transparent-background`)")
+                gr.Markdown("- nobg模型: 自动从 Hugging Face 下载并缓存到 `models/nobg/`")
                 gr.Markdown("- 首次使用时会自动从 Hugging Face 下载")
 
     rm_process_btn = gr.Button(
@@ -150,10 +175,15 @@ def create_image_matting_module():
         # rembg使用U2NET_HOME环境变量来存储模型
         os.environ["U2NET_HOME"] = rembg_cache_dir
         
-        # 判断是rembg模型还是高级模型
+        # 判断是rembg模型、高级模型还是nobg模型
         is_advanced_model = model_name in ADVANCED_MATTING_MODELS.keys()
+        is_nobg_model = model_name in NOBG_MODELS.keys()
         
-        if is_advanced_model:
+        if is_nobg_model:
+            repo_id = NOBG_MODELS.get(model_name)
+            print(f"[INFO] 使用 nobg 抠图模型: {model_name} ({repo_id})")
+            return process_with_nobg(files, bg_color, repo_id)
+        elif is_advanced_model:
             actual_model_name = ADVANCED_MATTING_MODELS.get(model_name)
             print(f"[INFO] 使用高级抠图模型: {model_name} ({actual_model_name})")
             return process_with_advanced_model(files, bg_color, actual_model_name)
@@ -534,6 +564,140 @@ def create_image_matting_module():
         
         if not processed_images:
             raise gr.Error("InSPyReNet 处理失败，请检查日志获取详细信息")
+        
+        success_count = len(processed_images)
+        return processed_images, f"处理完成，共处理 {success_count}/{total} 张图片"
+
+    def process_with_nobg(files, bg_color, repo_id):
+        """使用 nobg 的 AutoModel 加载 BiRefNet 模型进行抠图"""
+        from modules import shared
+        import torch
+        import numpy as np
+        from PIL import Image
+        import torch.nn.functional as F
+        
+        # 确保 nobg 模型缓存目录存在
+        nobg_cache_dir = os.path.join(shared.data_path, "models", "nobg")
+        os.makedirs(nobg_cache_dir, exist_ok=True)
+        
+        # 确保输出目录存在
+        save_dir = os.path.join(shared.data_path, "outputs", "image-matting")
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 获取设备
+        def get_device():
+            try:
+                if torch.cuda.is_available():
+                    return "cuda"
+                elif torch.backends.mps.is_available():
+                    return "mps"
+                else:
+                    return "cpu"
+            except:
+                return "cpu"
+        
+        device = get_device()
+        print(f"[INFO] nobg 使用设备: {device}")
+        
+        # 加载 nobg 模型
+        try:
+            # 添加插件内的 nobg 包到搜索路径
+            import sys
+            plugin_nobg_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nobg")
+            if plugin_nobg_dir not in sys.path:
+                sys.path.insert(0, plugin_nobg_dir)
+            
+            # 尝试从本地缓存加载，失败则从 Hugging Face 下载
+            from nobg import AutoModel, AutoProcessor
+            from huggingface_hub import snapshot_download
+            
+            # 检查本地缓存
+            local_repo_dir = os.path.join(nobg_cache_dir, repo_id.replace("/", "_"))
+            if os.path.exists(os.path.join(local_repo_dir, "model.safetensors")) or \
+               os.path.exists(os.path.join(local_repo_dir, "pytorch_model.bin")):
+                print(f"[INFO] nobg 从本地缓存加载: {local_repo_dir}")
+                model = AutoModel.from_pretrained(local_repo_dir, trust_remote_code=True)
+                processor = AutoProcessor.from_pretrained(local_repo_dir)
+            else:
+                print(f"[INFO] nobg 从 Hugging Face 下载模型: {repo_id}")
+                model = AutoModel.from_pretrained(repo_id, trust_remote_code=True)
+                processor = AutoProcessor.from_pretrained(repo_id)
+                # 缓存到本地
+                try:
+                    model.save_pretrained(local_repo_dir)
+                    processor.save_pretrained(local_repo_dir)
+                    print(f"[INFO] nobg 模型已缓存到: {local_repo_dir}")
+                except Exception as e:
+                    print(f"[WARNING] nobg 模型缓存失败: {e}")
+            
+            model.to(device)
+            model.eval()
+            
+        except ImportError as e:
+            raise gr.Error(f"缺少 nobg 依赖: {e}")
+        except Exception as e:
+            raise gr.Error(f"加载 nobg 模型失败: {str(e)}")
+        
+        processed_images = []
+        total = len(files)
+        
+        for i, file in enumerate(files):
+            try:
+                # 打开并处理图像
+                orig_image = Image.open(file.name).convert("RGB")
+                w, h = orig_image.size
+                
+                # 使用 processor 预处理图像
+                inputs = processor(images=orig_image, return_tensors="pt").to(device)
+                
+                # 推理
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                
+                # 后处理获取 alpha matte
+                mattes = processor.post_process_alpha_matting(
+                    outputs, target_sizes=[(h, w)]
+                )
+                alpha = mattes[0]  # (H, W) tensor in [0, 1]
+                
+                # 应用 alpha 蒙版
+                alpha_np = (alpha.cpu().numpy() * 255).astype(np.uint8)
+                mask = Image.fromarray(alpha_np, mode="L")
+                
+                if bg_color != "transparent":
+                    # 有背景颜色
+                    bg = Image.new("RGBA", orig_image.size, bg_color)
+                    orig_rgba = orig_image.convert("RGBA")
+                    bg.paste(orig_rgba, (0, 0), mask)
+                    img_final = bg.convert("RGB")
+                else:
+                    # 透明背景
+                    orig_rgba = orig_image.convert("RGBA")
+                    img_final = Image.new("RGBA", orig_image.size, (0, 0, 0, 0))
+                    img_final.paste(orig_rgba, (0, 0), mask)
+                
+                # 保存结果
+                repo_short = repo_id.split("/")[-1] if "/" in repo_id else repo_id
+                filename = os.path.splitext(os.path.basename(file.name))[0] + f"_{repo_short}_processed.png"
+                save_path = os.path.join(save_dir, filename)
+                img_final.save(save_path)
+                
+                orig_image.close()
+                if 'orig_rgba' in locals():
+                    orig_rgba.close()
+                mask.close()
+                img_final.close()
+                
+                processed_images.append(save_path)
+                print(f"[INFO] nobg 已处理 {i+1}/{total}: {os.path.basename(file.name)}")
+                
+            except Exception as e:
+                print(f"[ERROR] nobg 处理失败: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        
+        if not processed_images:
+            raise gr.Error("nobg 处理失败，请检查日志获取详细信息")
         
         success_count = len(processed_images)
         return processed_images, f"处理完成，共处理 {success_count}/{total} 张图片"
