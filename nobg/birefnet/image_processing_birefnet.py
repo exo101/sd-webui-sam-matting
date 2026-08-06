@@ -1,151 +1,240 @@
-from typing import TYPE_CHECKING, Union
+"""BiRefNet image processor — standalone version compatible with transformers 5.14.x.
+
+Replaces the upstream ``transformers.image_processing_backends``-based processor
+which requires transformers >= 5.16.  All preprocessing is done via direct
+``torchvision`` / ``PIL`` calls.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
-from transformers.image_processing_backends import TorchvisionBackend
-from transformers.image_processing_base import BatchFeature
-from transformers.image_utils import (
-    IMAGENET_DEFAULT_MEAN,
-    IMAGENET_DEFAULT_STD,
-    ChannelDimension,
-    ImageInput,
-    PILImageResampling,
-)
-from transformers.processing_utils import ImagesKwargs, Unpack
-from transformers.utils import TensorType
+import torchvision.transforms.functional as TF
+from PIL import Image
 
 if TYPE_CHECKING:
-    from PIL.Image import Image
+    from collections.abc import Mapping
+
+    import numpy as np
 
 
-class BiRefNetImageProcessor(TorchvisionBackend):
+# ---------------------------------------------------------------------------
+# Constants matching ImageNet statistics used by BiRefNet
+# ---------------------------------------------------------------------------
+IMAGENET_DEFAULT_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_DEFAULT_STD = [0.229, 0.224, 0.225]
+
+
+# ---------------------------------------------------------------------------
+# Lightweight image processor
+# ---------------------------------------------------------------------------
+class BiRefNetImageProcessor:
     """Image processor for BiRefNet.
 
-    Encapsulates the preprocessing used everywhere in the repo: RGB convert,
-    square resize to ``image_size`` (bilinear), scale to ``[0, 1]`` and ImageNet
-    normalization. ``preprocess`` optionally takes ``segmentation_maps`` and
-    returns binarized ``labels`` for training. ``post_process_alpha_matting``
-    turns raw model logits into alpha mattes, and ``cutout`` composites a matte
-    onto the original image.
+    Performs: RGB conversion, square resize, [0,1] rescale, ImageNet
+    normalization.  Also provides ``post_process_alpha_matting`` and
+    ``cutout`` helpers.
     """
 
-    resample = PILImageResampling.BILINEAR
+    resample = Image.BILINEAR
     image_mean = IMAGENET_DEFAULT_MEAN
     image_std = IMAGENET_DEFAULT_STD
-    # transformers reads/writes this class attr as part of the
-    # preprocessor_config.json schema, so a dict default is the required shape.
-    size = {"height": 1024, "width": 1024}  # noqa: RUF012
+    size = {"height": 1024, "width": 1024}
     default_to_square = True
     do_convert_rgb = True
     do_resize = True
     do_rescale = True
     do_normalize = True
-    rescale_factor = 1 / 255
+    rescale_factor = 1.0 / 255.0
 
-    def __init__(self, **kwargs: Unpack[ImagesKwargs]):
-        super().__init__(**kwargs)
+    def __init__(self, **kwargs: Any):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
 
-    def preprocess(
-        self,
-        images: ImageInput,
-        segmentation_maps: ImageInput | None = None,
-        **kwargs: Unpack[ImagesKwargs],
-    ) -> BatchFeature:
-        return super().preprocess(images, segmentation_maps, **kwargs)
+    def __call__(self, images=None, **kwargs):
+        """Alias for ``preprocess``, matching the transformers API convention."""
+        return self.preprocess(images, **kwargs)
 
-    def _preprocess_image_like_inputs(  # ty: ignore[invalid-method-override]
-        self,
-        images: ImageInput,
-        segmentation_maps: ImageInput | None,
-        do_convert_rgb: bool,
-        input_data_format: ChannelDimension,
-        return_tensors: str | TensorType | None,
-        device: Union[str, "torch.device"] | None = None,
-        **kwargs,
-    ) -> BatchFeature:
-        images = self._prepare_image_like_inputs(
-            images=images,
-            do_convert_rgb=do_convert_rgb,
-            input_data_format=input_data_format,
-            device=device,
-        )
-        # `_preprocess` returns a BatchFeature; index it so the outer call below
-        # controls tensor stacking via `return_tensors`.
-        pixel_values = self._preprocess(images, return_tensors=None, **kwargs)
-        data = {"pixel_values": pixel_values["pixel_values"]}
+    # ---- Preprocessing ----------------------------------------------------
 
-        if segmentation_maps is not None:
-            masks = self._prepare_image_like_inputs(
-                images=segmentation_maps,
-                expected_ndims=2,
-                do_convert_rgb=False,
-                input_data_format=ChannelDimension.FIRST,
-            )
-            # Resize + rescale to [0, 1] like the images (mirrors L-convert -> Resize
-            # -> ToTensor) but never normalize, then binarize to a hard alpha mask.
-            mask_kwargs = {**kwargs, "do_normalize": False, "do_rescale": True}
-            processed = self._preprocess(masks, return_tensors=None, **mask_kwargs)  # ty: ignore[invalid-argument-type]
-            # Keep the channel dim: BiRefNet expects labels of shape (B, 1, H, W).
-            data["labels"] = [
-                (m > 0.5).to(torch.float32) for m in processed["pixel_values"]
-            ]
+    def preprocess(self, images, **kwargs):
+        """Preprocess one or more PIL images into a tensor batch.
 
-        return BatchFeature(data=data, tensor_type=return_tensors)
+        Returns a dict-like ``BatchFeature`` with key ``"pixel_values"``.
+        """
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+
+        processed = []
+        for img in images:
+            if not isinstance(img, Image.Image):
+                img = Image.fromarray(img) if isinstance(img, (np.ndarray,)) else img
+            if self.do_convert_rgb:
+                img = img.convert("RGB")
+            if self.do_resize:
+                h = self.size.get("height", self.size.get("shortest_edge", 1024))
+                w = self.size.get("width", h)
+                img = img.resize((w, h), self.resample)
+            if self.do_rescale:
+                arr = TF.to_tensor(img)  # → [0, 1]  float32 C,H,W
+            else:
+                arr = torch.from_numpy(np.array(img)).float().permute(2, 0, 1) / 255.0
+            if self.do_normalize:
+                mean = torch.tensor(self.image_mean).view(3, 1, 1)
+                std = torch.tensor(self.image_std).view(3, 1, 1)
+                arr = (arr - mean) / std
+            processed.append(arr)
+
+        pixel_values = torch.stack(processed, dim=0)  # (B, 3, H, W)
+        return BatchFeature({"pixel_values": pixel_values})
+
+    # ---- Post-processing --------------------------------------------------
 
     def post_process_alpha_matting(
         self,
         outputs,
         target_sizes: list[tuple[int, int]] | None = None,
     ) -> list[torch.Tensor]:
-        """Convert raw BiRefNet logits into per-image alpha mattes in ``[0, 1]``.
+        """Convert raw BiRefNet logits into per-image alpha mattes in [0, 1].
 
         Args:
-            outputs: The model output; a dict with a ``"logits"`` key or an object
-                exposing ``.logits`` of shape ``(B, 1, H, W)``.
-            target_sizes: Optional list of ``(height, width)`` tuples, one per image;
-                each matte is bilinearly resized to its target size.
+            outputs: Model output dict with ``"logits"`` key, or object with
+                ``.logits`` attribute, shape ``(B, 1, H, W)``.
+            target_sizes: Optional list of ``(height, width)`` tuples, one per
+                image; each matte is bilinearly resized to its target size.
 
         Returns:
-            A list of ``(H, W)`` tensors with values in ``[0, 1]``.
+            List of ``(H, W)`` tensors with values in [0, 1].
         """
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         if target_sizes is not None and len(logits) != len(target_sizes):
             raise ValueError(
-                f"Got {len(target_sizes)} target sizes for a batch of {len(logits)} images"
+                f"Got {len(target_sizes)} target sizes for a batch of "
+                f"{len(logits)} images"
             )
-        # Sigmoid before resizing, matching the eval/benchmark scripts.
         probs = logits.sigmoid()
         mattes = []
         for idx in range(len(probs)):
             alpha = probs[idx].unsqueeze(0)  # (1, 1, H, W)
             if target_sizes is not None:
                 alpha = F.interpolate(
-                    alpha, size=target_sizes[idx], mode="bilinear", align_corners=False
+                    alpha, size=target_sizes[idx], mode="bilinear",
+                    align_corners=False,
                 )
             mattes.append(alpha[0, 0])
         return mattes
 
     @staticmethod
-    def cutout(image: "Image", alpha: Union[torch.Tensor, "Image"]) -> "Image":
-        """Composite an alpha matte onto ``image``, returning an RGBA cutout.
-
-        ``alpha`` may be a ``[0, 1]`` tensor of shape ``(H, W)`` or a PIL image; it
-        is resized to ``image.size`` if needed.
-        """
-        from PIL import Image as PILImage
-
+    def cutout(image: Image.Image, alpha: torch.Tensor | Image.Image) -> Image.Image:
+        """Composite an alpha matte onto ``image``, returning an RGBA cutout."""
         if isinstance(alpha, torch.Tensor):
             arr = (alpha.detach().clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
-            alpha = PILImage.fromarray(arr, mode="L")
+            alpha = Image.fromarray(arr, mode="L")
         if alpha.size != image.size:
-            alpha = alpha.resize(image.size, PILImage.Resampling.BILINEAR)
+            alpha = alpha.resize(image.size, Image.Resampling.BILINEAR)
         cutout = image.convert("RGBA")
         cutout.putalpha(alpha)
         return cutout
 
-    def push_to_hub(self, repo_id: str, **kwargs) -> str:
-        if "/" not in repo_id:
-            from huggingface_hub import whoami
+    # ---- HuggingFace Hub helpers ------------------------------------------
 
-            repo_id = f"{whoami()['name']}/{repo_id}"
-        return super().push_to_hub(repo_id, **kwargs)
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load processor config from a local directory or HF hub repo.
+
+        Simplified version that reads ``preprocessor_config.json`` from the
+        repo root and instantiates the processor with those settings.
+        """
+        import json
+        import os
+        from huggingface_hub import hf_hub_download
+
+        # Try local first, then HF hub
+        config_path = os.path.join(pretrained_model_name_or_path,
+                                   "preprocessor_config.json")
+        if not os.path.isfile(config_path):
+            try:
+                config_path = hf_hub_download(
+                    pretrained_model_name_or_path,
+                    "preprocessor_config.json",
+                    **{k: v for k, v in kwargs.items()
+                       if k in ("token", "revision", "cache_dir")},
+                )
+            except OSError:
+                # No config file — use defaults
+                return cls(**kwargs)
+
+        with open(config_path) as f:
+            config = json.load(f)
+
+        # Map HF-style keys to our class attributes
+        mapping = {
+            "size": "size",
+            "image_mean": "image_mean",
+            "image_std": "image_std",
+            "do_resize": "do_resize",
+            "do_rescale": "do_rescale",
+            "do_normalize": "do_normalize",
+            "do_convert_rgb": "do_convert_rgb",
+            "rescale_factor": "rescale_factor",
+        }
+        proc_kwargs = {}
+        for hf_key, attr in mapping.items():
+            val = config.get(hf_key, getattr(cls, attr, None))
+            if val is not None:
+                proc_kwargs[attr] = val
+
+        # Size from config (may be a dict or int)
+        size_val = config.get("size", cls.size)
+        if isinstance(size_val, (int, float)):
+            proc_kwargs["size"] = {"height": int(size_val), "width": int(size_val)}
+
+        proc_kwargs.update(kwargs)
+        return cls(**proc_kwargs)
+
+    def save_pretrained(self, save_directory: str, **kwargs):
+        """Save processor config to a local directory."""
+        import json
+        import os
+
+        os.makedirs(save_directory, exist_ok=True)
+        config = {
+            "image_processor_type": "BiRefNetImageProcessor",
+            "size": self.size,
+            "image_mean": self.image_mean,
+            "image_std": self.image_std,
+            "do_resize": self.do_resize,
+            "do_rescale": self.do_rescale,
+            "do_normalize": self.do_normalize,
+            "do_convert_rgb": self.do_convert_rgb,
+            "rescale_factor": self.rescale_factor,
+        }
+        path = os.path.join(save_directory, "preprocessor_config.json")
+        with open(path, "w") as f:
+            json.dump(config, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Minimal dict-like wrapper for the preprocess return value
+# ---------------------------------------------------------------------------
+class BatchFeature(dict):
+    """Minimal stand-in for ``transformers.image_processing_base.BatchFeature``."""
+
+    def __init__(self, data: Mapping[str, Any], tensor_type: str | None = None):
+        super().__init__(data)
+        self._tensor_type = tensor_type
+
+    def to(self, *args, **kwargs):
+        for k, v in self.items():
+            if isinstance(v, torch.Tensor):
+                self[k] = v.to(*args, **kwargs)
+        return self
+
+    def __getattr__(self, name: str):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None

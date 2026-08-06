@@ -1,4 +1,5 @@
 import json
+import os
 
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download, model_info
 from transformers.image_processing_base import ImageProcessingMixin
@@ -8,11 +9,23 @@ from .birefnet.modeling_birefnet import BiRefNet
 from .utils import set_doc
 
 
+def _is_local_path(path: str) -> bool:
+    """Check if a path is a local directory, not a HuggingFace repo ID."""
+    # A valid HF repo ID must not contain path separators, drive letters, or
+    # be an absolute/relative filesystem path.
+    return os.path.sep in path or (os.path.altsep and os.path.altsep in path)
+
+
 # Inspect repo parameters and return the appropriate model class
 class AutoModel:
     @classmethod
     @set_doc(PyTorchModelHubMixin.from_pretrained.__doc__)
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        if _is_local_path(pretrained_model_name_or_path):
+            # Local path — load directly without HF hub validation
+            return BiRefNet.from_pretrained(
+                pretrained_model_name_or_path, *model_args, **kwargs
+            )
         tags: list[str] = model_info(pretrained_model_name_or_path).tags or []
         if "nobg-birefnet" in tags or "birefnet" in tags:
             return BiRefNet.from_pretrained(
@@ -33,6 +46,11 @@ PROCESSOR_TYPES = {
 class AutoProcessor:
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        if _is_local_path(pretrained_model_name_or_path):
+            # Local path — use our custom from_pretrained directly
+            return BiRefNetImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
         try:
             config_dict, _ = ImageProcessingMixin.get_image_processor_dict(
                 pretrained_model_name_or_path, **kwargs
